@@ -1,0 +1,17 @@
+@import "tailwindcss";
+
+@theme {
+  --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
+  --animate-aura-slow: aura-pulse 2.8s ease-in-out infinite;
+  --animate-aura-fast: aura-pulse 1s ease-in-out infinite;
+}
+
+@keyframes aura-pulse {
+  0%,
+  100% {
+    filter: drop-shadow(0 0 var(--aura-near) var(--aura));
+  }
+  50% {
+    filter: drop-shadow(0 0 var(--aura-far) var(--aura));
+  }
+}
