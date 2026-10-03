@@ -13,6 +13,8 @@ type Ledger = {
   multiplier: Multiplier;
   currentSegmentStartTime: number | null;
   bankedEarnings: number;
+  bankedElapsedMs: number;
+  shiftStart: number | null;
   isPaused: boolean;
 };
 
@@ -21,8 +23,17 @@ const DEFAULT_LEDGER: Ledger = {
   multiplier: 1,
   currentSegmentStartTime: null,
   bankedEarnings: 0,
+  bankedElapsedMs: 0,
+  shiftStart: null,
   isPaused: false,
 };
+
+const START_OFFSETS: { minutes: number; label: string }[] = [
+  { minutes: 0, label: "Start Now" },
+  { minutes: 15, label: "-15 Min" },
+  { minutes: 30, label: "-30 Min" },
+  { minutes: 60, label: "-1 Hour" },
+];
 
 const RATES: { multiplier: Multiplier; label: string; hint: string }[] = [
   { multiplier: 1, label: "Base", hint: "1x" },
@@ -44,6 +55,37 @@ function formatUsd(amount: number) {
   return `$${safe.toFixed(4)}`;
 }
 
+function segmentElapsedMs(start: number, now: number) {
+  return Math.max(0, now - start);
+}
+
+function elapsedOnClock(ledger: Ledger, now: number) {
+  const open =
+    ledger.currentSegmentStartTime == null
+      ? 0
+      : segmentElapsedMs(ledger.currentSegmentStartTime, now);
+  return ledger.bankedElapsedMs + open;
+}
+
+function formatHms(ms: number) {
+  const totalSeconds = Math.floor(Math.max(0, ms) / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return [hours, minutes, seconds].map((part) => String(part).padStart(2, "0")).join(":");
+}
+
+function closeSegment(current: Ledger, now: number): Ledger {
+  if (current.currentSegmentStartTime == null) return current;
+  return {
+    ...current,
+    bankedEarnings:
+      current.bankedEarnings +
+      segmentPay(current.currentSegmentStartTime, now, current.baseWage, current.multiplier),
+    bankedElapsedMs: current.bankedElapsedMs + segmentElapsedMs(current.currentSegmentStartTime, now),
+  };
+}
+
 function readLedger(): Ledger | null {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
@@ -58,12 +100,22 @@ function readLedger(): Ledger | null {
     if (start != null && (typeof start !== "number" || !Number.isFinite(start))) return null;
 
     const isPaused = data.isPaused === true || (start == null && bankedEarnings > 0);
+    const currentSegmentStartTime = isPaused ? null : (start ?? null);
+    const bankedElapsedRaw = Number(data.bankedElapsedMs);
+    const bankedElapsedMs =
+      Number.isFinite(bankedElapsedRaw) && bankedElapsedRaw >= 0 ? bankedElapsedRaw : 0;
+    const shiftStart =
+      typeof data.shiftStart === "number" && Number.isFinite(data.shiftStart)
+        ? data.shiftStart
+        : currentSegmentStartTime;
     return {
       baseWage,
       multiplier: data.multiplier,
       bankedEarnings,
+      bankedElapsedMs,
+      shiftStart,
       isPaused,
-      currentSegmentStartTime: isPaused ? null : (start ?? null),
+      currentSegmentStartTime,
     };
   } catch {
     return null;
@@ -76,6 +128,7 @@ export function WageOdometer() {
   const [hydrated, setHydrated] = useState(false);
 
   const wageRef = useRef<HTMLSpanElement>(null);
+  const timeRef = useRef<HTMLSpanElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
   const paramsRef = useRef<Ledger>(DEFAULT_LEDGER);
 
@@ -84,13 +137,17 @@ export function WageOdometer() {
     if (node && node.style.transform === "") node.style.transform = "scaleX(0)";
   }, []);
 
-  const { multiplier, currentSegmentStartTime, bankedEarnings, isPaused } = ledger;
+  const { baseWage, multiplier, currentSegmentStartTime, bankedEarnings, isPaused } = ledger;
   const onClock = currentSegmentStartTime != null;
+  const perMinute = (baseWage * multiplier) / 60;
 
-  const paint = useCallback((totalEarned: number, percent?: number) => {
+  const paint = useCallback((totalEarned: number, percent?: number, elapsedMs?: number) => {
     const earned = Number.isFinite(totalEarned) ? Math.max(0, totalEarned) : 0;
     const completion = percent ?? Math.min(100, (earned / GOAL_DOLLARS) * 100);
     if (wageRef.current) wageRef.current.innerText = formatUsd(earned);
+    if (timeRef.current) {
+      timeRef.current.innerText = formatHms(elapsedMs ?? elapsedOnClock(paramsRef.current, Date.now()));
+    }
     if (barRef.current) {
       barRef.current.style.transform = `scaleX(${completion / 100})`;
     }
@@ -144,16 +201,17 @@ export function WageOdometer() {
     const tick = () => {
       const current = paramsRef.current;
       if (current.currentSegmentStartTime == null) return;
+      const now = Date.now();
       const totalEarned =
         current.bankedEarnings +
-        segmentPay(
-          current.currentSegmentStartTime,
-          Date.now(),
-          current.baseWage,
-          current.multiplier,
-        );
+        segmentPay(current.currentSegmentStartTime, now, current.baseWage, current.multiplier);
+      const elapsedMs =
+        current.bankedElapsedMs +
+        (current.currentSegmentStartTime == null
+          ? 0
+          : Math.max(0, now - current.currentSegmentStartTime));
       const percent = Math.min(100, (totalEarned / GOAL_DOLLARS) * 100);
-      paint(totalEarned, percent);
+      paint(totalEarned, percent, elapsedMs);
       frame = requestAnimationFrame(tick);
     };
 
@@ -184,11 +242,8 @@ export function WageOdometer() {
     }
     const now = Date.now();
     publish({
-      ...current,
+      ...closeSegment(current, now),
       multiplier: next,
-      bankedEarnings:
-        current.bankedEarnings +
-        segmentPay(current.currentSegmentStartTime, now, current.baseWage, current.multiplier),
       currentSegmentStartTime: now,
     });
   }
@@ -208,23 +263,23 @@ export function WageOdometer() {
     }
     const now = Date.now();
     publish({
-      ...current,
+      ...closeSegment(current, now),
       baseWage: nextWage,
-      bankedEarnings:
-        current.bankedEarnings +
-        segmentPay(current.currentSegmentStartTime, now, current.baseWage, current.multiplier),
       currentSegmentStartTime: now,
     });
   }
 
-  function startShift() {
+  function startShift(offsetMinutes: number) {
     const current = paramsRef.current;
     if (current.currentSegmentStartTime != null || current.isPaused) return;
+    const punchedAt = Date.now() - offsetMinutes * 60_000;
     publish({
       ...current,
       bankedEarnings: 0,
+      bankedElapsedMs: 0,
       isPaused: false,
-      currentSegmentStartTime: Date.now(),
+      shiftStart: punchedAt,
+      currentSegmentStartTime: punchedAt,
     });
   }
 
@@ -232,12 +287,8 @@ export function WageOdometer() {
     const current = paramsRef.current;
     if (current.currentSegmentStartTime != null) {
       const now = Date.now();
-      const banked =
-        current.bankedEarnings +
-        segmentPay(current.currentSegmentStartTime, now, current.baseWage, current.multiplier);
       publish({
-        ...current,
-        bankedEarnings: banked,
+        ...closeSegment(current, now),
         currentSegmentStartTime: null,
         isPaused: true,
       });
@@ -255,6 +306,8 @@ export function WageOdometer() {
     publish({
       ...paramsRef.current,
       bankedEarnings: 0,
+      bankedElapsedMs: 0,
+      shiftStart: null,
       isPaused: false,
       currentSegmentStartTime: null,
     });
@@ -279,6 +332,10 @@ export function WageOdometer() {
           className={`min-w-[12ch] text-[clamp(2.75rem,12vw,4.25rem)] leading-none font-semibold tabular-nums transition-colors duration-500 ${auraClass}`}
         >
           <span ref={wageRef}>$0.0000</span>
+        </p>
+        <p className="text-sm text-gray-400 tabular-nums">+${perMinute.toFixed(2)} / min</p>
+        <p className="text-sm text-zinc-400 tabular-nums">
+          Time on the clock <span ref={timeRef}>00:00:00</span>
         </p>
         <p className={`text-sm tracking-wide ${isPaused ? "text-amber-600" : onClock ? "text-amber-200/80" : "text-zinc-600"}`}>
           {isPaused ? "Off the clock" : onClock ? "On the clock" : "Not started"}
@@ -355,24 +412,31 @@ export function WageOdometer() {
         </span>
       </label>
 
-      <div className="mt-auto grid grid-cols-2 gap-2">
-        <button
-          type="button"
-          onClick={startShift}
-          disabled={onClock || isPaused}
-          className="min-h-14 rounded-2xl bg-amber-300 text-base font-semibold text-zinc-950 disabled:bg-zinc-800 disabled:text-zinc-500"
-        >
-          Start Shift
-        </button>
-        <button
-          type="button"
-          onClick={resetShift}
-          disabled={!shiftStarted}
-          className="min-h-14 rounded-2xl border border-zinc-700 text-base font-semibold text-zinc-300 disabled:border-zinc-800 disabled:text-zinc-600"
-        >
-          Reset
-        </button>
-      </div>
+      {!onClock && !isPaused ? (
+        <div className="mt-auto grid grid-cols-2 gap-2" aria-label="Start shift">
+          {START_OFFSETS.map((offset) => (
+            <button
+              key={offset.minutes}
+              type="button"
+              onClick={() => startShift(offset.minutes)}
+              className="min-h-14 rounded-2xl bg-amber-300 text-base font-semibold text-zinc-950"
+            >
+              {offset.label}
+            </button>
+          ))}
+        </div>
+      ) : (
+        <div className="mt-auto">
+          <button
+            type="button"
+            onClick={resetShift}
+            disabled={!shiftStarted}
+            className="min-h-14 w-full rounded-2xl border border-zinc-700 text-base font-semibold text-zinc-300 disabled:border-zinc-800 disabled:text-zinc-600"
+          >
+            Reset
+          </button>
+        </div>
+      )}
     </main>
   );
 }
